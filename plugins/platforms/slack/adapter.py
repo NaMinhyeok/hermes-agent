@@ -84,6 +84,14 @@ class _ThreadContextCache:
     parent_text: str = ""  # Raw text of the thread parent (for reply_to_text injection)
 
 
+class SlackHistoryAccessError(RuntimeError):
+    """Stable adapter-boundary failure for the agent-facing history seam."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 def check_slack_requirements() -> bool:
     """Check if Slack dependencies are available.
 
@@ -446,6 +454,11 @@ class SlackAdapter(BasePlatformAdapter):
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
         self._channel_team: Dict[str, str] = {}  # channel_id → team_id
+        # Published only after connect() finishes authentication and starts
+        # Socket Mode. The agent-facing history seam checks this together with
+        # the stable connected state, so a partially populated reconnect cannot
+        # look like a single-workspace adapter.
+        self._configured_workspace_count = 0
         # Dedup cache: prevents duplicate bot responses when Socket Mode
         # reconnects redeliver events.
         self._dedup = MessageDeduplicator()
@@ -953,6 +966,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Slack via Socket Mode."""
+        # Reset before every early-return/await path. A failed reconnect must
+        # never leave the agent-facing read seam trusting stale cardinality.
+        self._configured_workspace_count = 0
         if not SLACK_AVAILABLE:
             logger.error(
                 "[Slack] slack-bolt not installed. Run: pip install slack-bolt",
@@ -1000,6 +1016,8 @@ class SlackAdapter(BasePlatformAdapter):
                         )
             except Exception as e:
                 logger.warning("[Slack] Failed to read %s: %s", tokens_file, e)
+
+        configured_workspace_count = len(bot_tokens)
 
         lock_acquired = False
         try:
@@ -1085,8 +1103,20 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register message event handler
             @self._app.event("message")
-            async def handle_message_event(event, say):
-                await self._handle_slack_message(event)
+            async def handle_message_event(event, say, context=None, body=None):
+                installation_team_id = self._resolve_installation_team_id(
+                    (context or {}).get("team_id")
+                    or (body or {}).get("team_id")
+                )
+                if self._team_clients and not installation_team_id:
+                    logger.warning(
+                        "[Slack] Dropping message from an unresolved installation"
+                    )
+                    return
+                await self._handle_slack_message(
+                    event,
+                    installation_team_id=installation_team_id,
+                )
 
             # Handle app_mention explicitly. In some Slack app configurations,
             # channel mentions arrive only as app_mention events rather than the
@@ -1096,15 +1126,39 @@ class SlackAdapter(BasePlatformAdapter):
             # @mention, they share the same event ts — the dedup in
             # _handle_slack_message (MessageDeduplicator) suppresses the second.
             @self._app.event("app_mention")
-            async def handle_app_mention(event, say):
-                await self._handle_slack_message(event)
+            async def handle_app_mention(event, say, context=None, body=None):
+                installation_team_id = self._resolve_installation_team_id(
+                    (context or {}).get("team_id")
+                    or (body or {}).get("team_id")
+                )
+                if self._team_clients and not installation_team_id:
+                    logger.warning(
+                        "[Slack] Dropping app mention from an unresolved installation"
+                    )
+                    return
+                await self._handle_slack_message(
+                    event,
+                    installation_team_id=installation_team_id,
+                )
 
             # File lifecycle events can arrive around snippet uploads even when
             # the actual user message is what we care about. Ack them so Slack
             # doesn't log noisy 404 "unhandled request" warnings.
             @self._app.event("file_shared")
-            async def handle_file_shared(event, say):
-                await self._handle_slack_file_shared(event)
+            async def handle_file_shared(event, say, context=None, body=None):
+                installation_team_id = self._resolve_installation_team_id(
+                    (context or {}).get("team_id")
+                    or (body or {}).get("team_id")
+                )
+                if self._team_clients and not installation_team_id:
+                    logger.warning(
+                        "[Slack] Dropping file share from an unresolved installation"
+                    )
+                    return
+                await self._handle_slack_file_shared(
+                    event,
+                    installation_team_id=installation_team_id,
+                )
 
             @self._app.event("file_created")
             async def handle_file_created(event, say):
@@ -1245,10 +1299,12 @@ class SlackAdapter(BasePlatformAdapter):
             # let the ``finally`` block release the platform lock cleanly.
             try:
                 self._start_socket_mode_handler()
+                self._configured_workspace_count = configured_workspace_count
                 self._running = True
                 self._ensure_socket_watchdog()
             except Exception:
                 self._running = False
+                self._configured_workspace_count = 0
                 try:
                     await self._stop_socket_mode_handler()
                 except Exception:  # pragma: no cover - defensive logging
@@ -1316,6 +1372,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Slack."""
         self._running = False
+        self._configured_workspace_count = 0
 
         watchdog_task = self._socket_watchdog_task
         self._socket_watchdog_task = None
@@ -1348,6 +1405,83 @@ class SlackAdapter(BasePlatformAdapter):
         if team_id and team_id in self._team_clients:
             return self._team_clients[team_id]
         return self._app.client  # fallback to primary
+
+    def _resolve_installation_team_id(self, candidate: object = "") -> str:
+        """Validate a trusted Bolt outer team against owned clients."""
+
+        team_id = str(candidate or "").strip()
+        if not self._team_clients:
+            return team_id
+        return team_id if team_id in self._team_clients else ""
+
+    async def read_history_for_agent(
+        self,
+        *,
+        channel_id: str,
+        expected_team_id: str,
+        thread_ts: str = "",
+        limit: int = 20,
+        latest: str = "",
+        oldest: str = "",
+        cursor: str = "",
+        inclusive: bool = False,
+    ) -> Dict[str, Any]:
+        """Read bounded history with this adapter's workspace-specific client.
+
+        The model-facing ``slack`` tool is intentionally current-channel only;
+        this adapter seam owns the transport so it reuses Slack SDK proxy,
+        authentication, and proxy configuration instead of constructing a
+        second client from process-global credentials. Profile multiplexing
+        remains supported because each turn resolves its profile's adapter.
+
+        A single adapter may also be configured with several workspace tokens.
+        That topology is deliberately unsupported here: without a stable
+        per-turn installation identity, channel IDs alone are not sufficient
+        authorization. Require a fully connected, single-workspace adapter and
+        fail closed before any Slack SDK call otherwise.
+        """
+
+        if not self._running or not self._app:
+            raise SlackHistoryAccessError("adapter_unavailable")
+        if (
+            self._configured_workspace_count != 1
+            or len(self._team_clients) != 1
+        ):
+            raise SlackHistoryAccessError("multi_workspace_unsupported")
+        team_id = self._resolve_installation_team_id(expected_team_id)
+        if not team_id or team_id != next(iter(self._team_clients)):
+            raise SlackHistoryAccessError("workspace_mismatch")
+        client = self._team_clients[team_id]
+
+        allowed_channels = self._slack_allowed_channels()
+        if (
+            not channel_id.startswith("D")
+            and allowed_channels
+            and channel_id not in allowed_channels
+        ):
+            raise SlackHistoryAccessError("channel_not_allowed")
+        kwargs: Dict[str, Any] = {
+            "channel": channel_id,
+            "limit": max(1, min(int(limit), 100)),
+        }
+        if latest:
+            kwargs["latest"] = latest
+        if oldest:
+            kwargs["oldest"] = oldest
+        if cursor:
+            kwargs["cursor"] = cursor
+        if latest or oldest:
+            kwargs["inclusive"] = bool(inclusive)
+
+        if thread_ts:
+            response = await client.conversations_replies(ts=thread_ts, **kwargs)
+        else:
+            response = await client.conversations_history(**kwargs)
+
+        data = getattr(response, "data", response)
+        if not isinstance(data, dict):
+            raise RuntimeError("Slack returned a non-object history response")
+        return dict(data)
 
     async def send(
         self,
@@ -2508,7 +2642,12 @@ class SlackAdapter(BasePlatformAdapter):
         self._cache_assistant_thread_metadata(metadata)
         self._seed_assistant_thread_session(metadata)
 
-    async def _handle_slack_file_shared(self, event: dict) -> None:
+    async def _handle_slack_file_shared(
+        self,
+        event: dict,
+        *,
+        installation_team_id: str = "",
+    ) -> None:
         """Fallback for Slack file shares that do not arrive as message.files.
 
         Slack documents ``file_shared`` as a file-ID-only event; callers must
@@ -2517,12 +2656,18 @@ class SlackAdapter(BasePlatformAdapter):
         message event, but some video shares have only been observed through
         this lifecycle event.
         """
+        installation_team_id = self._resolve_installation_team_id(
+            installation_team_id
+        )
+        if self._team_clients and not installation_team_id:
+            return
+
         channel_id = event.get("channel_id") or event.get("channel") or ""
         file_id = event.get("file_id") or (event.get("file") or {}).get("id") or ""
         if not channel_id or not file_id:
             return
 
-        team_id = event.get("team_id") or event.get("team") or ""
+        team_id = installation_team_id
         try:
             client = self._team_clients.get(team_id) if team_id else None
             info_resp = await (client or self._get_client(channel_id)).files_info(
@@ -2584,10 +2729,27 @@ class SlackAdapter(BasePlatformAdapter):
         }
         if thread_ts and thread_ts != ts:
             fallback_event["thread_ts"] = thread_ts
-        await self._handle_slack_message(fallback_event)
+        await self._handle_slack_message(
+            fallback_event,
+            installation_team_id=installation_team_id,
+        )
 
-    async def _handle_slack_message(self, event: dict) -> None:
+    async def _handle_slack_message(
+        self,
+        event: dict,
+        *,
+        installation_team_id: str = "",
+    ) -> None:
         """Handle an incoming Slack message event."""
+        installation_team_id = self._resolve_installation_team_id(
+            installation_team_id
+        )
+        if self._team_clients and not installation_team_id:
+            logger.warning(
+                "[Slack] Dropping inbound event with unresolved installation"
+            )
+            return
+
         # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777)
         event_ts = event.get("ts", "")
         if event_ts and self._dedup.is_duplicate(event_ts):
@@ -2746,7 +2908,7 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = event.get("user") or assistant_meta.get("user_id", "")
         if not channel_id:
             channel_id = assistant_meta.get("channel_id", "")
-        team_id = (
+        team_id = installation_team_id or (
             event.get("team")
             or event.get("team_id")
             or assistant_meta.get("team_id", "")
@@ -3173,7 +3335,9 @@ class SlackAdapter(BasePlatformAdapter):
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
+            guild_id=installation_team_id or None,
         )
+        source.delivered_via_direct_slack_adapter = bool(installation_team_id)
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (
@@ -3915,6 +4079,12 @@ class SlackAdapter(BasePlatformAdapter):
         user_id = command.get("user_id", "")
         channel_id = command.get("channel_id", "")
         team_id = command.get("team_id", "")
+        installation_team_id = self._resolve_installation_team_id(team_id)
+        if self._team_clients and not installation_team_id:
+            logger.warning(
+                "[Slack] Dropping slash command with unresolved installation"
+            )
+            return
 
         # Track which workspace owns this channel
         if team_id and channel_id:
@@ -3957,7 +4127,9 @@ class SlackAdapter(BasePlatformAdapter):
             chat_id=channel_id,
             chat_type="dm" if is_dm else "group",
             user_id=user_id,
+            guild_id=installation_team_id or None,
         )
+        source.delivered_via_direct_slack_adapter = bool(installation_team_id)
 
         event = MessageEvent(
             text=text,

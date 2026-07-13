@@ -394,6 +394,7 @@ def make_tool_result_message(name: str, content: Any, tool_call_id: str) -> dict
 # promptware defense.  Skipped for short outputs (under 32 chars) where the
 # overhead of the wrapper outweighs any indirect-injection risk.
 _UNTRUSTED_TOOL_NAMES = frozenset({
+    "slack",
     "web_extract",
     "web_search",
 })
